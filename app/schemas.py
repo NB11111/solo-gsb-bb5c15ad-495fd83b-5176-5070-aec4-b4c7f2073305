@@ -204,11 +204,45 @@ class PaymentOut(BaseModel):
     amount: str
     currency: str
     created_at: str
+    reversed_amount: str = "0"
+    net_amount: str
 
 
 class PaymentResult(PaymentOut):
     """登记收款成功后的响应：收款记录 + 最新余额。"""
 
+    paid_total: str
+    outstanding: str
+
+
+class PaymentReversalCreate(BaseModel):
+    amount: str = Field(
+        description="本次冲销金额，原收款发票币种的十进制字符串，必须大于 0 且为币种"
+        "最小单位的整数倍，如 '33.11'；同一笔收款可分次冲销，累计不得超过原收款"
+    )
+
+    @field_validator("amount")
+    @classmethod
+    def _check_amount(cls, v: str) -> str:
+        v = v.strip()
+        if not _DECIMAL_RE.match(v):
+            raise ValueError(f"amount 必须是十进制数字字符串，收到 {v!r}")
+        return v
+
+
+class PaymentReversalResult(BaseModel):
+    """冲销成功后的响应：冲销记录 + 原流水冲销进度与发票最新余额。"""
+
+    model_config = ConfigDict(extra="allow")
+    id: int
+    payment_id: int
+    invoice_id: int
+    amount: str
+    currency: str
+    created_at: str
+    payment_amount: str
+    reversed_total: str
+    payment_net_amount: str
     paid_total: str
     outstanding: str
 
@@ -281,6 +315,7 @@ class PaymentOverview(BaseModel):
     invoice_id: int
     currency: str
     total_gross: str
+    reversed_total: str
     paid_total: str
     outstanding: str
     payment_count: int

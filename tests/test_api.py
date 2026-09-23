@@ -720,5 +720,247 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(ov["payment_count"], 5)
 
 
+    def test_15_payment_reversals(self) -> None:
+        # gross 100.00 的 USD 发票，登记两笔收款 60 / 40
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD", "lines": [{"net": "100.00", "tax_rate": "0"}]},
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        status, p1 = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "60.00"}
+        )
+        self.assertEqual(status, 201, p1)
+        pid1 = p1["id"]
+        # 新登记的流水尚无冲销，净入账 = 原金额
+        self.assertEqual(p1["reversed_amount"], "0.00")
+        self.assertEqual(p1["net_amount"], "60.00")
+        status, p2 = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "40"}
+        )
+        self.assertEqual(status, 201, p2)
+        self.assertEqual(p2["outstanding"], "0.00")
+        pid2 = p2["id"]
+
+        # 未知流水 -> 404
+        status, body = self._request(
+            "POST", "/api/v1/payments/999999/reversals", {"amount": "1.00"}
+        )
+        self.assertEqual(status, 404)
+        self.assertIn("999999", body["detail"])
+
+        # 分次冲销第一笔：20 + 20
+        status, rev = self._request(
+            "POST", f"/api/v1/payments/{pid1}/reversals", {"amount": "20"}
+        )
+        self.assertEqual(status, 201, rev)
+        self.assertEqual(rev["id"], 1)
+        self.assertEqual(rev["payment_id"], pid1)
+        self.assertEqual(rev["invoice_id"], invoice_id)
+        self.assertEqual(rev["amount"], "20.00")
+        self.assertEqual(rev["currency"], "USD")
+        self.assertIn("created_at", rev)
+        self.assertEqual(rev["payment_amount"], "60.00")
+        self.assertEqual(rev["reversed_total"], "20.00")
+        self.assertEqual(rev["payment_net_amount"], "40.00")
+        # 发票整体按净入账：100 - 20 = 80，余额 20
+        self.assertEqual(rev["paid_total"], "80.00")
+        self.assertEqual(rev["outstanding"], "20.00")
+
+        status, rev = self._request(
+            "POST", f"/api/v1/payments/{pid1}/reversals", {"amount": "20.00"}
+        )
+        self.assertEqual(status, 201, rev)
+        self.assertEqual(rev["reversed_total"], "40.00")
+        self.assertEqual(rev["payment_net_amount"], "20.00")
+        self.assertEqual(rev["paid_total"], "60.00")
+        self.assertEqual(rev["outstanding"], "40.00")
+
+        # 超额：再冲 20.01（仅剩 20 可冲）-> 422，不写入
+        status, body = self._request(
+            "POST", f"/api/v1/payments/{pid1}/reversals", {"amount": "20.01"}
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("detail", body)
+
+        # 金额非正 / 非最小单位 / 非十进制 -> 422
+        for bad in ("0", "-5.00", "0.001", "abc"):
+            status, _ = self._request(
+                "POST", f"/api/v1/payments/{pid2}/reversals", {"amount": bad}
+            )
+            self.assertEqual(status, 422, bad)
+        status, _ = self._request(
+            "POST", f"/api/v1/payments/{pid2}/reversals", {"amount": 1.5}
+        )
+        self.assertEqual(status, 422)
+
+        # 冲销记录单独持久化：原收款流水仍在，金额不变；第二笔无任何冲销记录
+        status, ov = self._request("GET", f"/api/v1/invoices/{invoice_id}/payments")
+        self.assertEqual(status, 200)
+        self.assertEqual(ov["payment_count"], 2)
+        self.assertEqual([p["id"] for p in ov["payments"]], [pid1, pid2])
+        by_id = {p["id"]: p for p in ov["payments"]}
+        self.assertEqual(by_id[pid1]["amount"], "60.00")  # 原收款未被删除/改写
+        self.assertEqual(by_id[pid1]["reversed_amount"], "40.00")
+        self.assertEqual(by_id[pid1]["net_amount"], "20.00")
+        self.assertEqual(by_id[pid2]["reversed_amount"], "0.00")
+        self.assertEqual(by_id[pid2]["net_amount"], "40.00")
+        # 顶层：冲销合计 40，净入账 60，未收余额 40
+        self.assertEqual(ov["reversed_total"], "40.00")
+        self.assertEqual(ov["paid_total"], "60.00")
+        self.assertEqual(ov["outstanding"], "40.00")
+
+        # 恰好冲满第一笔剩余 20
+        status, rev = self._request(
+            "POST", f"/api/v1/payments/{pid1}/reversals", {"amount": "20.00"}
+        )
+        self.assertEqual(status, 201, rev)
+        self.assertEqual(rev["reversed_total"], "60.00")
+        self.assertEqual(rev["payment_net_amount"], "0.00")
+        self.assertEqual(rev["outstanding"], "60.00")
+        # 冲满后再冲 0.01 -> 422，不留记录
+        status, _ = self._request(
+            "POST", f"/api/v1/payments/{pid1}/reversals", {"amount": "0.01"}
+        )
+        self.assertEqual(status, 422)
+
+        # 原流水依旧保留
+        status, ov = self._request("GET", f"/api/v1/invoices/{invoice_id}/payments")
+        by_id = {p["id"]: p for p in ov["payments"]}
+        self.assertEqual(by_id[pid1]["amount"], "60.00")
+        self.assertEqual(by_id[pid1]["reversed_amount"], "60.00")
+        self.assertEqual(by_id[pid1]["net_amount"], "0.00")
+        self.assertEqual(ov["reversed_total"], "60.00")
+        self.assertEqual(ov["paid_total"], "40.00")
+        self.assertEqual(ov["outstanding"], "60.00")
+
+        # JPY（0 位小数）：非最小单位 0.5 -> 422
+        status, inv_j = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "JPY", "lines": [{"net": "1000", "tax_rate": "0"}]},
+        )
+        self.assertEqual(status, 201, inv_j)
+        status, pj = self._request(
+            "POST", f"/api/v1/invoices/{inv_j['id']}/payments", {"amount": "1000"}
+        )
+        self.assertEqual(status, 201, pj)
+        status, _ = self._request(
+            "POST", f"/api/v1/payments/{pj['id']}/reversals", {"amount": "0.5"}
+        )
+        self.assertEqual(status, 422)
+        status, revj = self._request(
+            "POST", f"/api/v1/payments/{pj['id']}/reversals", {"amount": "300"}
+        )
+        self.assertEqual(status, 201, revj)
+        self.assertEqual(revj["amount"], "300")
+        self.assertEqual(revj["payment_net_amount"], "700")
+        self.assertEqual(revj["outstanding"], "300")
+
+    def test_16_reversals_affect_balance_overdue_and_allocation(self) -> None:
+        # gross 100、due 2026-09-01：收满后逾期查询不可见；冲销后按净入账重新可见
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {
+                "currency": "USD",
+                "due_date": "2026-09-01",
+                "lines": [{"net": "100.00", "tax_rate": "0"}],
+            },
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        status, pay = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "100.00"}
+        )
+        self.assertEqual(status, 201, pay)
+        pid = pay["id"]
+
+        status, overdue = self._request(
+            "GET", "/api/v1/invoices/overdue?as_of=2026-09-23&page_size=100"
+        )
+        self.assertNotIn(invoice_id, [it["id"] for it in overdue["items"]])
+
+        # 冲销 40 -> 净入账 60，余额 40，重新逾期
+        status, rev = self._request(
+            "POST", f"/api/v1/payments/{pid}/reversals", {"amount": "40.00"}
+        )
+        self.assertEqual(status, 201, rev)
+        status, overdue = self._request(
+            "GET", "/api/v1/invoices/overdue?as_of=2026-09-23&page_size=100"
+        )
+        item = next(it for it in overdue["items"] if it["id"] == invoice_id)
+        self.assertEqual(item["paid_total"], "60.00")
+        self.assertEqual(item["outstanding"], "40.00")
+
+        # 后续来款分配按净入账额：余额 40，只能分配 40；请求 40.01 -> 422
+        status, resp = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "40.01", "invoice_ids": [invoice_id]},
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("detail", resp)
+        status, alloc = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "40.00", "invoice_ids": [invoice_id]},
+        )
+        self.assertEqual(status, 201, alloc)
+        self.assertEqual(alloc["allocations"][0]["outstanding"], "0.00")
+
+        # 分配后又收满 -> 逾期再次消失；单张查询里原冲销流水仍可审计
+        status, overdue = self._request(
+            "GET", "/api/v1/invoices/overdue?as_of=2026-09-23&page_size=100"
+        )
+        self.assertNotIn(invoice_id, [it["id"] for it in overdue["items"]])
+        status, ov = self._request("GET", f"/api/v1/invoices/{invoice_id}/payments")
+        self.assertEqual(ov["reversed_total"], "40.00")
+        self.assertEqual(ov["paid_total"], "100.00")
+        self.assertEqual(ov["outstanding"], "0.00")
+
+    def test_17_concurrent_reversals_no_overrun(self) -> None:
+        # gross 100，一笔收款 100：10 个并发冲销各 20.00，
+        # 同事务读累计+写入 -> 恰好 5 笔成功、5 笔 422，累计冲销不超过原收款
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD", "lines": [{"net": "100.00", "tax_rate": "0"}]},
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        status, pay = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "100.00"}
+        )
+        self.assertEqual(status, 201, pay)
+        pid = pay["id"]
+
+        codes: list[int] = []
+        lock = threading.Lock()
+
+        def reverse() -> None:
+            code, _ = self._request(
+                "POST", f"/api/v1/payments/{pid}/reversals", {"amount": "20.00"}
+            )
+            with lock:
+                codes.append(code)
+
+        threads = [threading.Thread(target=reverse) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sorted(codes), [201] * 5 + [422] * 5)
+        status, ov = self._request("GET", f"/api/v1/invoices/{invoice_id}/payments")
+        self.assertEqual(ov["payments"][0]["reversed_amount"], "100.00")
+        self.assertEqual(ov["payments"][0]["net_amount"], "0.00")
+        self.assertEqual(ov["reversed_total"], "100.00")
+        self.assertEqual(ov["paid_total"], "0.00")
+        self.assertEqual(ov["outstanding"], "100.00")
+
+
 if __name__ == "__main__":
     unittest.main()
