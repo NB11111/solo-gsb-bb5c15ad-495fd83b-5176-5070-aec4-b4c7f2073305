@@ -7,6 +7,7 @@
 - **残差固定分配且可复算**：发票总额与「逐行舍入后税额之和」的差（残差）按**最大余数法**确定性地分配回具体行，任何时候用同一请求复算结果完全一致（响应中带 `recompute_matched` 标志）。
 - **跨币种换算**：按请求汇率换算，原币金额完整保留，目标币独立做最小单位舍入与残差分配。
 - **收款登记**：按发票登记收款（发票币种字符串、必须大于 0），随时查询收款记录与未收余额；累计收款不得超过含税总额，校验与写入在同一 SQLite 事务中完成，并发不会超收。
+- **收款冲销**：`POST /api/v1/payments/{payment_id}/reversals` 对已登记的收款流水冲销（可同一笔分次冲销，累计不得超过原收款）；冲销记录单独持久化、不删除原收款，未收余额、逾期查询与后续来款分配一律按**净入账额**（收款 − 冲销）计算，累计校验与写入在同一 SQLite 写事务内完成，并发冲销不会超额。
 - **来款分配**：传入币种、金额字符串与待结发票 ID 列表，把一笔来款按**到期日升序（未设置到期日排最后）、同日按 ID 升序**逐张抵扣；只处理列表内发票，不做跨币种换算。金额必须是币种最小单位的正整数倍；列表重复、发票不存在、币种不符或总未收不足时**整笔拒绝、不留下部分收款**。每张被抵扣的发票沿用同一条 `payments` 流水，单张收款查询与逾期查询均可见。
 - **到期日与逾期查询**：创建发票时可选填 ISO 日期 `due_date`；`GET /api/v1/invoices/overdue` 按截止日（可选 `as_of`，缺省取 UTC 当前日期）分页返回**已到期且未收余额大于零**的发票，含币种与精确（Decimal）未收余额。
 - **SQLite 持久化**（WAL 模式），提供创建、按 id 查询、分页列表、健康检查。
@@ -67,6 +68,11 @@ curl -s -X POST http://localhost:8000/api/v1/invoices/1/payments \
   -d '{"amount": "20.00"}'
 
 curl -s http://localhost:8000/api/v1/invoices/1/payments
+
+# 冲销该笔收款的一部分（假设上一步返回的收款流水 id 为 1），可分次冲销
+curl -s -X POST http://localhost:8000/api/v1/payments/1/reversals \
+  -H 'Content-Type: application/json' \
+  -d '{"amount": "5.00"}'
 
 # 一笔来款分配到多张待结发票（按到期日升序、同日 ID 升序、无到期日排最后）
 curl -s -X POST http://localhost:8000/api/v1/payment-allocations \
@@ -166,7 +172,8 @@ Base URL：`http://localhost:8000`（本地先用 Docker Compose 启动：
 | `GET` | `/api/v1/invoices?page=1&page_size=20` | 分页列表（按 id 倒序），`page_size` 范围 1~100 |
 | `GET` | `/api/v1/invoices/overdue` | 逾期发票分页查询（按 id 倒序），支持 `page`、`page_size`、可选 `as_of` |
 | `POST` | `/api/v1/invoices/{id}/payments` | 登记一笔收款（发票币种字符串、必须大于 0），`201` |
-| `GET` | `/api/v1/invoices/{id}/payments` | 查询该发票的收款记录与未收余额 |
+| `GET` | `/api/v1/invoices/{id}/payments` | 查询该发票的收款记录（含各流水已冲销金额与净入账额）与未收余额 |
+| `POST` | `/api/v1/payments/{payment_id}/reversals` | 冲销一笔收款（可分次，累计不超过原收款），`201` |
 | `POST` | `/api/v1/payment-allocations` | 一笔来款在多张待结发票间按到期日顺序分配，`201` |
 | `GET` | `/docs` `/redoc` `/openapi.json` | 交互式 API 文档 |
 
@@ -250,7 +257,7 @@ curl -s -X POST http://localhost:8000/api/v1/invoices/1/payments \
   -d '{"amount": "20.00"}'
 ```
 
-响应 `201`（收款记录 + 最新余额）：
+响应 `201`（收款记录 + 最新余额；`paid_total`/`outstanding` 均按净入账额计算）：
 
 ```json
 {
@@ -259,6 +266,8 @@ curl -s -X POST http://localhost:8000/api/v1/invoices/1/payments \
   "amount": "20.00",
   "currency": "USD",
   "created_at": "2026-09-23T02:10:00Z",
+  "reversed_total": "0.00",
+  "net_amount": "20.00",
   "paid_total": "20.00",
   "outstanding": "13.11"
 }
@@ -276,16 +285,72 @@ curl -s http://localhost:8000/api/v1/invoices/1/payments
   "currency": "USD",
   "total_gross": "33.11",
   "paid_total": "20.00",
+  "reversed_total": "0.00",
   "outstanding": "13.11",
   "payment_count": 1,
   "payments": [
     {"id": 1, "invoice_id": 1, "amount": "20.00", "currency": "USD",
-     "created_at": "2026-09-23T02:10:00Z"}
+     "created_at": "2026-09-23T02:10:00Z",
+     "reversed_total": "0.00", "net_amount": "20.00"}
   ]
 }
 ```
 
-### 3.4 逾期发票查询 `GET /api/v1/invoices/overdue`
+每条流水附带 `reversed_total`（该流水已冲销金额合计）与 `net_amount`
+（净入账额 = `amount` − `reversed_total`）；顶层 `paid_total` 为全发票
+**净入账合计**，`outstanding` = `total_gross` − `paid_total`。
+
+### 3.4 收款冲销 `POST /api/v1/payments/{payment_id}/reversals`
+
+对已登记的一笔收款流水做冲销（红冲/退款等场景）。`payment_id` 为收款登记
+（或来款分配）响应中的流水 `id`。
+
+请求体（金额用字符串）：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `amount` | string | 是 | 本次冲销金额，**发票币种**的十进制字符串；必须 **大于 0**、为币种最小单位的整数倍，且与历史冲销**累计不得超过原收款金额** |
+
+规则：
+
+- **允许同一笔收款分次冲销**：每次冲销独立成一条记录，累计冲销 ≤ 原收款金额。
+- 冲销记录写入独立的 `payment_reversals` 表并关联原流水，**不删除原收款**；
+  原流水在收款查询中始终可见（`amount` 不变，`reversed_total`/`net_amount` 实时反映冲销）。
+- 冲销后全库按**净入账额**（收款 − 冲销）计算：该发票未收余额相应回升、
+  可能重新进入逾期列表，释放的余额可被后续收款/来款分配再次使用。
+- 累计冲销计算与写入在**同一个 `BEGIN IMMEDIATE` 写事务**内完成，与收款登记、
+  来款分配共用同一串行化机制：并发冲销不会超额。
+- 任何校验失败都回滚，**不留下任何冲销记录**：流水不存在 → `404`；
+  金额 ≤ 0、非最小单位整数倍、累计超额 → `422`。
+
+```bash
+# 冲销收款流水 1 中的 5.00 USD（原收款 20.00）
+curl -s -X POST http://localhost:8000/api/v1/payments/1/reversals \
+  -H 'Content-Type: application/json' \
+  -d '{"amount": "5.00"}'
+```
+
+响应 `201`（冲销记录 + 原流水最新累计冲销与净入账额）：
+
+```json
+{
+  "id": 1,
+  "payment_id": 1,
+  "invoice_id": 1,
+  "amount": "5.00",
+  "currency": "USD",
+  "created_at": "2026-09-23T04:00:00Z",
+  "reversed_total": "5.00",
+  "net_amount": "15.00"
+}
+```
+
+随后查询 `GET /api/v1/invoices/1/payments` 可见：`paid_total` 降为 `15.00`、
+`reversed_total` 为 `5.00`、`outstanding` 回升为 `18.11`，流水 1 的
+`net_amount` 为 `15.00`；再冲 `15.00` 即冲完（`net_amount` 归 `0.00`），
+此后对该流水的任何冲销都返回 `422`。
+
+### 3.5 逾期发票查询 `GET /api/v1/invoices/overdue`
 
 查询参数：
 
@@ -299,10 +364,11 @@ curl -s http://localhost:8000/api/v1/invoices/1/payments
 
 1. 发票设置了 `due_date`（**缺少到期日的不纳入**）；
 2. `due_date` **严格早于** `as_of`（到期日当天不算逾期）；
-3. **未收余额大于零**（`total_gross − 已收合计 > 0`），已收满的发票不纳入。
+3. **未收余额大于零**（`total_gross − 净入账合计 > 0`，净入账 = 收款 − 冲销），
+   已收满的发票不纳入；收款被冲销后余额回升，发票会重新进入逾期列表。
 
 结果**按 id 倒序**分页；每条包含发票 `id`、`currency`、`due_date`、含税总额
-`total_gross`、已收合计 `paid_total` 与精确未收余额 `outstanding`（均为发票币种的
+`total_gross`、净入账合计 `paid_total` 与精确未收余额 `outstanding`（均为发票币种的
 十进制字符串，余额计算全程 `Decimal`，沿用收款登记的最小单位规则），响应体额外
 回显实际使用的 `as_of`。
 
@@ -337,7 +403,7 @@ curl -s 'http://localhost:8000/api/v1/invoices/overdue'
 
 无逾期发票时 `items` 为空、`total`/`pages` 为 `0`。
 
-### 3.5 来款分配 `POST /api/v1/payment-allocations`
+### 3.6 来款分配 `POST /api/v1/payment-allocations`
 
 把一笔来款在**多张同币种待结发票**间按到期日顺序逐张抵扣。
 
@@ -354,7 +420,8 @@ curl -s 'http://localhost:8000/api/v1/invoices/overdue'
 1. 将列表内发票按 `due_date` **升序**排列——**未设置到期日的发票排最后**；
    同一到期日（或都未设置到期日）按发票 **ID 升序**。
 2. 按该顺序逐张抵扣，每张分配 `min(剩余来款, 该发票未收余额)`；来款用尽即止，
-   之后的发票分配 `0`（**不产生**收款流水）。
+   之后的发票分配 `0`（**不产生**收款流水）。未收余额按**净入账额**
+   （收款 − 冲销）计算，冲销释放的余额可再次被分配。
 3. 列表内发票**未收余额合计小于来款金额**时，整笔请求返回 `422`，事务回滚，
    **不会留下任何部分收款**。
 
@@ -405,12 +472,12 @@ curl -s -X POST http://localhost:8000/api/v1/payment-allocations \
   因此 `GET /api/v1/invoices/{id}/payments` 与逾期分页查询都能看到分配结果，
   与单张收款登记完全一致。
 
-### 3.6 错误码
+### 3.7 错误码
 
 | 状态码 | 场景 |
 | --- | --- |
-| `404` | 发票 id 不存在（含单张收款登记/查询、来款分配时列表中任一 id 不存在） |
-| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款/来款金额 ≤ 0、金额小于币种最小单位、累计收款或列表总未收不足、来款列表为空或 ID 重复、来款与发票币种不一致、`due_date` / `as_of` 不是合法 ISO 日期、分页参数越界等（响应体 `detail` 为中文说明） |
+| `404` | 发票 id 不存在（含单张收款登记/查询、来款分配时列表中任一 id 不存在）；冲销时收款流水 `payment_id` 不存在 |
+| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款/来款/冲销金额 ≤ 0、金额小于币种最小单位、累计收款或列表总未收不足、累计冲销超过原收款、来款列表为空或 ID 重复、来款与发票币种不一致、`due_date` / `as_of` 不是合法 ISO 日期、分页参数越界等（响应体 `detail` 为中文说明） |
 
 ---
 
@@ -452,7 +519,8 @@ python -m unittest tests.test_calc -v
 
 # API 端到端（自动在空闲端口起真实 uvicorn：健康检查、增查、分页、收款登记/余额、
 # 超额 422 不留记录、并发不超收、due_date 持久化、逾期分页/422、
-# 来款分配排序/整笔拒绝/分配与单张收款混合并发不超收、持久化）
+# 来款分配排序/整笔拒绝/分配与单张收款混合并发不超收、
+# 收款冲销分次/超额 422 不留记录/并发冲销不超额/冲销后余额回升再分配、持久化）
 python -m unittest tests.test_api -v
 ```
 
@@ -463,14 +531,14 @@ python -m unittest tests.test_api -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页 / 逾期查询 / 单张收款 / 来款分配
+│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页 / 逾期查询 / 单张收款 / 收款冲销 / 来款分配
 │   ├── calc.py        # Decimal 计算核心：HALF_UP + 最大余数法残差分配（纯函数）
 │   ├── currency.py    # ISO 4217 币种最小单位表 + CURRENCY_DIGITS 扩展
-│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串，含 due_date / 逾期 / 来款分配模型）
-│   └── db.py          # SQLite 建表（含旧库迁移）/ 事务写入（发票 + 收款 + 来款分配）/ 查询（含逾期，WAL）
+│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串，含 due_date / 逾期 / 冲销 / 来款分配模型）
+│   └── db.py          # SQLite 建表（含旧库迁移）/ 事务写入（发票 + 收款 + 冲销 + 来款分配）/ 查询（含逾期，WAL）
 ├── tests/
 │   ├── test_calc.py   # 20 个计算规则单测
-│   └── test_api.py    # 真实 HTTP 端到端测试（含收款/来款分配并发不超收、到期日与逾期查询）
+│   └── test_api.py    # 真实 HTTP 端到端测试（含收款/冲销/来款分配并发不超收不超额、到期日与逾期查询）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -478,9 +546,13 @@ python -m unittest tests.test_api -v
 ```
 
 存储模型：`invoices`（发票头 + 汇总金额 + 可选到期日 `due_date` + 原始请求 JSON，
-供复算）、`invoice_lines`（逐行最终税额/含税及换算列）与 `payments`（收款登记：
-金额、币种、登记时间）三张表，均通过外键级联删除。来款分配不引入新表：每张被
+供复算）、`invoice_lines`（逐行最终税额/含税及换算列）、`payments`（收款登记：
+金额、币种、登记时间）与 `payment_reversals`（收款冲销：金额、币种、登记时间，
+外键关联 `payments.id`）四张表，均通过外键级联删除。冲销不改动原收款流水，
+余额一律按净入账额（收款 − 冲销）实时计算。来款分配不引入新表：每张被
 抵扣的发票向 `payments` 写入一条同构流水（整笔失败则全部不写），因此单张收款
-查询与逾期查询天然可见分配结果。升级到含 `due_date` 的版本时，
-服务启动会自动对旧库执行 `ALTER TABLE ... ADD COLUMN due_date`，历史发票的
-到期日为空、不会出现在逾期结果中。
+查询与逾期查询天然可见分配结果，分配产生的流水同样可以被冲销。升级到含
+`due_date` / `payment_reversals` 的版本时，服务启动会自动对旧库执行
+`ALTER TABLE ... ADD COLUMN due_date` 与 `CREATE TABLE IF NOT EXISTS`，
+历史发票的到期日为空、不会出现在逾期结果中，历史收款无冲销记录、净入账额
+等于原收款金额。

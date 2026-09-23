@@ -1,9 +1,11 @@
 """SQLite 持久化层。
 
-存储三张表：
-* ``invoices``      —— 发票头（含原始请求 JSON，用于复算）与汇总金额；
-* ``invoice_lines`` —— 逐行结果（税额残差分配后的最终值，含换算列）；
-* ``payments``      —— 收款登记（每笔收款的金额、币种与登记时间）。
+存储四张表：
+* ``invoices``          —— 发票头（含原始请求 JSON，用于复算）与汇总金额；
+* ``invoice_lines``     —— 逐行结果（税额残差分配后的最终值，含换算列）；
+* ``payments``          —— 收款登记（每笔收款的金额、币种与登记时间）；
+* ``payment_reversals`` —— 收款冲销（每笔冲销的金额、币种与登记时间，
+  关联原收款流水；原收款不删除，余额一律按净入账额 = 收款 − 冲销 计算）。
 """
 
 from __future__ import annotations
@@ -65,6 +67,16 @@ CREATE TABLE IF NOT EXISTS payments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_payments_invoice_id ON payments(invoice_id);
+
+CREATE TABLE IF NOT EXISTS payment_reversals (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    payment_id INTEGER NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+    amount     TEXT NOT NULL,
+    currency   TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_reversals_payment_id ON payment_reversals(payment_id);
 """
 
 
@@ -74,6 +86,14 @@ class InvoiceNotFoundError(Exception):
     def __init__(self, invoice_id: int) -> None:
         self.invoice_id = invoice_id
         super().__init__(f"发票 {invoice_id} 不存在")
+
+
+class PaymentNotFoundError(Exception):
+    """冲销时原收款流水不存在。"""
+
+    def __init__(self, payment_id: int) -> None:
+        self.payment_id = payment_id
+        super().__init__(f"收款流水 {payment_id} 不存在")
 
 
 def utc_now_iso() -> str:
@@ -216,11 +236,11 @@ def list_overdue_invoices(
     """逾期发票分页查询。
 
     逾期口径：``due_date`` 非空且 **严格早于** ``as_of``，且按 Decimal 逐笔求和
-    得到的未收余额（total_gross − Σ payments.amount）**大于 0**；缺少到期日、
-    已收满（余额 0）的发票不纳入。结果按 id 倒序。
+    得到的未收余额（total_gross − 净入账合计，净入账 = Σ payments − Σ reversals）
+    **大于 0**；缺少到期日、已收满（余额 0）的发票不纳入。结果按 id 倒序。
 
-    未收余额不走 SQLite 浮点聚合：一次性取回候选发票的收款流水，在 Python 侧
-    用 Decimal 逐发票（每张发票币种单一）求和。
+    未收余额不走 SQLite 浮点聚合：一次性取回候选发票的收款与冲销流水，在
+    Python 侧用 Decimal 逐发票（每张发票币种单一）求和。
     """
 
     as_of_text = as_of.isoformat()
@@ -237,15 +257,7 @@ def list_overdue_invoices(
     if not rows:
         return [], 0
 
-    paid_rows = conn.execute(
-        "SELECT invoice_id, amount FROM payments WHERE invoice_id IN (%s)"
-        % ",".join(str(int(r["id"])) for r in rows)
-    ).fetchall()
-    paid_map: dict[int, Decimal] = {}
-    for pr in paid_rows:
-        paid_map[pr["invoice_id"]] = paid_map.get(
-            pr["invoice_id"], Decimal("0")
-        ) + Decimal(pr["amount"])
+    paid_map = _paid_totals(conn, [int(r["id"]) for r in rows])
 
     overdue: list[dict[str, Any]] = []
     for r in rows:
@@ -280,13 +292,38 @@ def _minor_unit(digits: int) -> Decimal:
     return Decimal(1).scaleb(-digits)
 
 
+def _reversed_totals(conn: sqlite3.Connection, payment_ids: list[int]) -> dict[int, Decimal]:
+    """一批收款流水的已冲销合计。用 Decimal 逐笔求和，不走 SQLite 的浮点 SUM 聚合。"""
+
+    if not payment_ids:
+        return {}
+    placeholders = ",".join("?" for _ in payment_ids)
+    rows = conn.execute(
+        "SELECT payment_id, amount FROM payment_reversals"
+        f" WHERE payment_id IN ({placeholders})",
+        payment_ids,
+    ).fetchall()
+    totals: dict[int, Decimal] = {}
+    for r in rows:
+        pid = int(r["payment_id"])
+        totals[pid] = totals.get(pid, Decimal("0")) + Decimal(r["amount"])
+    return totals
+
+
 def _paid_total(conn: sqlite3.Connection, invoice_id: int) -> Decimal:
-    """已收金额合计。用 Decimal 逐笔求和，不走 SQLite 的浮点 SUM 聚合。"""
+    """净入账合计：收款 − 冲销。用 Decimal 逐笔求和，不走 SQLite 的浮点 SUM 聚合。"""
 
     rows = conn.execute(
-        "SELECT amount FROM payments WHERE invoice_id = ?", (invoice_id,)
+        "SELECT id, amount FROM payments WHERE invoice_id = ?", (invoice_id,)
     ).fetchall()
-    return sum((Decimal(r["amount"]) for r in rows), Decimal("0"))
+    reversed_map = _reversed_totals(conn, [int(r["id"]) for r in rows])
+    return sum(
+        (
+            Decimal(r["amount"]) - reversed_map.get(int(r["id"]), Decimal("0"))
+            for r in rows
+        ),
+        Decimal("0"),
+    )
 
 
 def register_payment(
@@ -295,10 +332,11 @@ def register_payment(
     """登记一笔收款：余额校验与写入在 **同一个事务** 中完成。
 
     使用 ``BEGIN IMMEDIATE`` 在事务开始即取得写锁，把并发的收款请求串行化，
-    「读已收合计 -> 校验未收余额 -> 写入」之间不会被另一笔收款插队，避免超收。
+    「读净入账合计 -> 校验未收余额 -> 写入」之间不会被另一笔收款/冲销插队，
+    避免超收。
 
     * 发票不存在 -> :class:`InvoiceNotFoundError`
-    * 金额不是币种最小单位整数倍、或累计收款将超过含税总额 -> ``ValueError``
+    * 金额不是币种最小单位整数倍、或累计净入账将超过含税总额 -> ``ValueError``
       （事务回滚，不留下任何记录；由 API 层映射为 422）
     """
 
@@ -348,26 +386,108 @@ def register_payment(
         "amount": format(amount, "f"),
         "currency": inv["currency"],
         "created_at": created_at,
+        "reversed_total": format(Decimal("0").quantize(unit), "f"),
+        "net_amount": format(amount, "f"),
         "paid_total": format(new_paid, "f"),
         "outstanding": format(gross - new_paid, "f"),
     }
 
 
+# ---- 收款冲销 ----
+
+
+def reverse_payment(
+    conn: sqlite3.Connection, payment_id: int, amount: Decimal
+) -> dict[str, Any]:
+    """冲销一笔收款（可同一笔分次冲销）：累计计算与写入在 **同一个事务** 中完成。
+
+    冲销记录写入独立的 ``payment_reversals`` 表并关联原流水，**不删除原收款**；
+    全库的未收余额、逾期查询与来款分配都按净入账额（收款 − 冲销）计算，
+    冲销后发票的未收余额相应回升。
+
+    使用 ``BEGIN IMMEDIATE`` 在事务开始即取得写锁，与 :func:`register_payment`、
+    :func:`allocate_payment` 及其他冲销请求串行化：「读原流水与累计冲销 ->
+    校验不超额 -> 写入」在同一事务内完成，并发冲销不会超额。
+
+    * 原收款流水不存在 -> :class:`PaymentNotFoundError`
+    * 金额 ≤ 0、不是币种最小单位整数倍、或累计冲销将超过原收款金额 ->
+      ``ValueError``（事务回滚，不留下任何记录；由 API 层映射为 422）
+    """
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        pay = conn.execute(
+            """
+            SELECT p.id, p.invoice_id, p.amount, p.currency, i.currency_digits
+            FROM payments p JOIN invoices i ON i.id = p.invoice_id
+            WHERE p.id = ?
+            """,
+            (payment_id,),
+        ).fetchone()
+        if pay is None:
+            raise PaymentNotFoundError(payment_id)
+
+        unit = _minor_unit(int(pay["currency_digits"]))
+        if amount <= 0:
+            raise ValueError(f"冲销金额必须大于 0，收到 {amount}")
+        if (amount / unit) != (amount / unit).to_integral_value():
+            raise ValueError(
+                f"冲销金额 {amount} 不是 {pay['currency']} 最小单位 {unit} 的整数倍"
+            )
+        amount = amount.quantize(unit)
+
+        original = Decimal(pay["amount"])
+        reversed_so_far = _reversed_totals(conn, [payment_id]).get(
+            payment_id, Decimal("0")
+        )
+        if reversed_so_far + amount > original:
+            raise ValueError(
+                f"冲销 {amount} 后累计冲销将达 {reversed_so_far + amount}，"
+                f"超过原收款 {original}（已冲销 {reversed_so_far}），未写入任何记录"
+            )
+
+        created_at = utc_now_iso()
+        cur = conn.execute(
+            """
+            INSERT INTO payment_reversals (payment_id, amount, currency, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (payment_id, format(amount, "f"), pay["currency"], created_at),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    new_reversed = reversed_so_far + amount
+    return {
+        "id": int(cur.lastrowid),
+        "payment_id": payment_id,
+        "invoice_id": int(pay["invoice_id"]),
+        "amount": format(amount, "f"),
+        "currency": pay["currency"],
+        "created_at": created_at,
+        "reversed_total": format(new_reversed, "f"),
+        "net_amount": format(original - new_reversed, "f"),
+    }
+
+
 def _paid_totals(conn: sqlite3.Connection, invoice_ids: list[int]) -> dict[int, Decimal]:
-    """一批发票的已收金额合计。用 Decimal 逐笔求和，不走 SQLite 的浮点 SUM 聚合。"""
+    """一批发票的净入账合计（收款 − 冲销）。用 Decimal 逐笔求和，不走浮点 SUM 聚合。"""
 
     if not invoice_ids:
         return {}
     placeholders = ",".join("?" for _ in invoice_ids)
     rows = conn.execute(
-        f"SELECT invoice_id, amount FROM payments WHERE invoice_id IN ({placeholders})",
+        f"SELECT id, invoice_id, amount FROM payments WHERE invoice_id IN ({placeholders})",
         invoice_ids,
     ).fetchall()
+    reversed_map = _reversed_totals(conn, [int(r["id"]) for r in rows])
     paid: dict[int, Decimal] = {}
     for r in rows:
-        paid[int(r["invoice_id"])] = paid.get(
-            int(r["invoice_id"]), Decimal("0")
-        ) + Decimal(r["amount"])
+        iid = int(r["invoice_id"])
+        net = Decimal(r["amount"]) - reversed_map.get(int(r["id"]), Decimal("0"))
+        paid[iid] = paid.get(iid, Decimal("0")) + net
     return paid
 
 
@@ -381,11 +501,12 @@ def allocate_payment(
 
     分配顺序：``due_date`` 升序（未设置到期日的排最后）、同一到期日按发票 ID
     升序；只处理 ``invoice_ids`` 中的发票，不做跨币种换算。按顺序逐张抵扣：
-    每张分配 ``min(剩余来款, 该发票未收余额)``，来款用尽即止。
+    每张分配 ``min(剩余来款, 该发票未收余额)``，来款用尽即止。未收余额按
+    **净入账额**（收款 − 冲销）计算，冲销释放的余额可以再次被分配。
 
-    使用 ``BEGIN IMMEDIATE`` 在事务开始即取得写锁，与 :func:`register_payment`
-    及彼此的来款分配请求串行化：「读发票/已收合计 -> 校验 -> 写入多条 payments」
-    在同一事务内完成，并发收款不会超收。
+    使用 ``BEGIN IMMEDIATE`` 在事务开始即取得写锁，与 :func:`register_payment`、
+    :func:`reverse_payment` 及彼此的来款分配请求串行化：「读发票/净入账合计 ->
+    校验 -> 写入多条 payments」在同一事务内完成，并发收款不会超收。
 
     任一前置条件不满足都回滚，**不留下任何收款记录**：
 
@@ -501,7 +622,11 @@ def allocate_payment(
 
 
 def payment_overview(conn: sqlite3.Connection, invoice: sqlite3.Row) -> dict[str, Any]:
-    """某张发票的收款记录列表与未收余额（供 GET 使用）。"""
+    """某张发票的收款记录与未收余额（供 GET 使用）。
+
+    每条流水附带已冲销金额 ``reversed_total`` 与净入账额 ``net_amount``；
+    顶层 ``paid_total`` 为全发票净入账合计，``outstanding`` 按净入账额计算。
+    """
 
     rows = list(
         conn.execute(
@@ -510,23 +635,35 @@ def payment_overview(conn: sqlite3.Connection, invoice: sqlite3.Row) -> dict[str
         ).fetchall()
     )
     unit = _minor_unit(int(invoice["currency_digits"]))
-    paid = sum((Decimal(r["amount"]) for r in rows), Decimal("0")).quantize(unit)
+    reversed_map = _reversed_totals(conn, [int(r["id"]) for r in rows])
     gross = Decimal(invoice["total_gross"])
-    return {
-        "invoice_id": invoice["id"],
-        "currency": invoice["currency"],
-        "total_gross": invoice["total_gross"],
-        "paid_total": format(paid, "f"),
-        "outstanding": format(gross - paid, "f"),
-        "payment_count": len(rows),
-        "payments": [
+    paid = Decimal("0")
+    reversed_total = Decimal("0")
+    payments: list[dict[str, Any]] = []
+    for r in rows:
+        rev = reversed_map.get(int(r["id"]), Decimal("0")).quantize(unit)
+        net = Decimal(r["amount"]) - rev
+        paid += net
+        reversed_total += rev
+        payments.append(
             {
                 "id": r["id"],
                 "invoice_id": r["invoice_id"],
                 "amount": r["amount"],
                 "currency": r["currency"],
                 "created_at": r["created_at"],
+                "reversed_total": format(rev, "f"),
+                "net_amount": format(net, "f"),
             }
-            for r in rows
-        ],
+        )
+    paid = paid.quantize(unit)
+    return {
+        "invoice_id": invoice["id"],
+        "currency": invoice["currency"],
+        "total_gross": invoice["total_gross"],
+        "paid_total": format(paid, "f"),
+        "reversed_total": format(reversed_total.quantize(unit), "f"),
+        "outstanding": format(gross - paid, "f"),
+        "payment_count": len(rows),
+        "payments": payments,
     }

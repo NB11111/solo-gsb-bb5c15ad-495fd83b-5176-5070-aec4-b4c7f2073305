@@ -29,6 +29,8 @@ from .schemas import (
     PaymentCreate,
     PaymentOverview,
     PaymentResult,
+    ReversalCreate,
+    ReversalResult,
     parse_iso_date,
 )
 
@@ -43,10 +45,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
+        "收款冲销（分次冲销、按净入账额计算余额）、"
         "一笔来款在多张同币种待结发票间按到期日顺序分配、"
         "到期日（due_date）与逾期发票分页查询，SQLite 持久化。"
     ),
@@ -318,3 +321,30 @@ def read_payments(
     if row is None:
         raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
     return database.payment_overview(conn, row)
+
+
+@app.post(
+    "/api/v1/payments/{payment_id}/reversals",
+    response_model=ReversalResult,
+    status_code=201,
+    tags=["payments"],
+)
+def create_reversal(
+    payment_id: int,
+    payload: ReversalCreate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """冲销一笔收款：可同一笔分次冲销，累计不得超过原收款金额。
+
+    冲销记录单独持久化（不删除原收款）；未收余额、逾期查询与后续来款分配
+    均按净入账额（收款 − 冲销）计算。
+    """
+
+    amount = to_decimal(payload.amount, "amount")
+    if amount <= 0:
+        # 走全局 ValueError -> 422 处理器
+        raise ValueError(f"冲销金额必须大于 0，收到 {payload.amount!r}")
+    try:
+        return database.reverse_payment(conn, payment_id, amount)
+    except database.PaymentNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

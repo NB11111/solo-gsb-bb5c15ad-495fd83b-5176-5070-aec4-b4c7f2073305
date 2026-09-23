@@ -204,6 +204,8 @@ class PaymentOut(BaseModel):
     amount: str
     currency: str
     created_at: str
+    reversed_total: str
+    net_amount: str
 
 
 class PaymentResult(PaymentOut):
@@ -275,16 +277,48 @@ class PaymentAllocationResult(BaseModel):
 
 
 class PaymentOverview(BaseModel):
-    """按发票查询的收款记录与未收余额。"""
+    """按发票查询的收款记录与未收余额（余额按净入账额 = 收款 − 冲销 计算）。"""
 
     model_config = ConfigDict(extra="allow")
     invoice_id: int
     currency: str
     total_gross: str
     paid_total: str
+    reversed_total: str
     outstanding: str
     payment_count: int
     payments: list[PaymentOut]
+
+
+# ---- 收款冲销 ----
+
+class ReversalCreate(BaseModel):
+    amount: str = Field(
+        description="本次冲销金额，发票币种的十进制字符串；必须大于 0、为币种最小单位的整数倍，"
+        "且与历史冲销累计不得超过原收款金额，如 '5.00'"
+    )
+
+    @field_validator("amount")
+    @classmethod
+    def _check_amount(cls, v: str) -> str:
+        v = v.strip()
+        if not _DECIMAL_RE.match(v):
+            raise ValueError(f"amount 必须是十进制数字字符串，收到 {v!r}")
+        return v
+
+
+class ReversalResult(BaseModel):
+    """冲销成功后的响应：冲销记录 + 原流水的累计冲销与净入账额。"""
+
+    model_config = ConfigDict(extra="allow")
+    id: int
+    payment_id: int
+    invoice_id: int
+    amount: str
+    currency: str
+    created_at: str
+    reversed_total: str
+    net_amount: str
 
 
 # ---- 逾期查询 ----
